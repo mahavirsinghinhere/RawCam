@@ -1,0 +1,325 @@
+name: Build RawCam APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Write project files
+        run: |
+          mkdir -p app/src/main/java/com/example/rawcam
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "RawCam"
+          include(":app")
+          EOF
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+          cat > app/build.gradle.kts <<'EOF'
+          plugins { id("com.android.application"); id("org.jetbrains.kotlin.android") }
+          android {
+              namespace = "com.example.rawcam"
+              compileSdk = 34
+              defaultConfig { applicationId = "com.example.rawcam"; minSdk = 31; targetSdk = 34; versionCode = 1; versionName = "1.0" }
+              compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.CAMERA" />
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
+              <application android:label="RawCam" android:theme="@android:style/Theme.Material.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true" android:screenOrientation="landscape">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+          cat > app/src/main/java/com/example/rawcam/MainActivity.kt <<'EOF'
+          package com.example.rawcam
+
+          import android.Manifest
+          import android.annotation.SuppressLint
+          import android.app.Activity
+          import android.content.ContentValues
+          import android.content.pm.PackageManager
+          import android.graphics.ImageFormat
+          import android.graphics.SurfaceTexture
+          import android.hardware.camera2.*
+          import android.media.ExifInterface
+          import android.media.ImageReader
+          import android.media.MediaCodecList
+          import android.media.MediaRecorder
+          import android.os.*
+          import android.provider.MediaStore
+          import android.util.Size
+          import android.view.*
+          import android.widget.*
+          import java.io.File
+          import java.text.SimpleDateFormat
+          import java.util.*
+          import java.util.concurrent.ConcurrentHashMap
+          import java.util.concurrent.Executors
+          import java.util.concurrent.atomic.AtomicInteger
+
+          /**
+           * Two modes:
+           *  1) Clean video  : 1080p60, HEVC @100 Mbps, all stabilisation / denoise / sharpening switched off.
+           *  2) RAW DNG mode : true sensor RAW (Bayer) frames saved as a DNG sequence (needs RAW support from the camera HAL).
+           */
+          class MainActivity : Activity() {
+              private lateinit var cm: CameraManager
+              private lateinit var tv: TextureView
+              private lateinit var info: TextView
+              private lateinit var rec: Button
+              private lateinit var rawSw: Switch
+              private val bg = HandlerThread("cam").apply { start() }
+              private val h = Handler(bg.looper)
+              private val ui = Handler(Looper.getMainLooper())
+              private var cam: CameraDevice? = null
+              private var session: CameraCaptureSession? = null
+              private var chars: CameraCharacteristics? = null
+              private var camId = ""
+              private var recorder: MediaRecorder? = null
+              private var videoFile: File? = null
+              private var reader: ImageReader? = null
+              private var recording = false
+              private var hint = 0
+              private var t0 = 0L
+              private var rawRel = ""
+              private val results = ConcurrentHashMap<Long, TotalCaptureResult>()
+              private val seq = AtomicInteger(); private val saved = AtomicInteger()
+              private val dropped = AtomicInteger(); private val pending = AtomicInteger()
+              private val pool = Executors.newFixedThreadPool(3)
+
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                  cm = getSystemService(CameraManager::class.java)
+                  tv = TextureView(this)
+                  info = TextView(this).apply { setTextColor(-1); textSize = 12f; setBackgroundColor(0x99000000.toInt()); maxWidth = 520 }
+                  rec = Button(this).apply { text = "REC"; setOnClickListener { toggle() } }
+                  rawSw = Switch(this).apply {
+                      text = "RAW DNG mode "; setTextColor(-1)
+                      setOnCheckedChangeListener { _, _ -> if (!recording) open() }
+                  }
+                  val dm = resources.displayMetrics
+                  val hh = minOf(dm.widthPixels, dm.heightPixels)
+                  val root = FrameLayout(this).apply { setBackgroundColor(0) }
+                  root.addView(tv, FrameLayout.LayoutParams(hh * 16 / 9, hh, Gravity.CENTER))
+                  val panel = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; addView(info); addView(rawSw); addView(rec) }
+                  root.addView(panel, FrameLayout.LayoutParams(-2, -2, Gravity.END or Gravity.CENTER_VERTICAL))
+                  setContentView(root)
+                  tv.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+                      override fun onSurfaceTextureAvailable(s: SurfaceTexture, w: Int, hgt: Int) { open() }
+                      override fun onSurfaceTextureSizeChanged(s: SurfaceTexture, w: Int, hgt: Int) {}
+                      override fun onSurfaceTextureDestroyed(s: SurfaceTexture) = true
+                      override fun onSurfaceTextureUpdated(s: SurfaceTexture) {}
+                  }
+              }
+
+              private fun ready() = checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED &&
+                      checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+
+              override fun onResume() {
+                  super.onResume()
+                  if (!ready()) requestPermissions(arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO), 1)
+                  else if (tv.isAvailable) open()
+              }
+              override fun onRequestPermissionsResult(c: Int, p: Array<out String>, r: IntArray) { if (tv.isAvailable) open() }
+              override fun onPause() { recording = false; closeCam(); super.onPause() }
+
+              private fun hasRaw(c: CameraCharacteristics) =
+                  c.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)?.contains(CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_RAW) == true
+
+              private fun say(t: String) = runOnUiThread { info.text = t }
+
+              private fun open() {
+                  if (!ready() || !tv.isAvailable) return
+                  closeCam()
+                  val backs = cm.cameraIdList.filter { cm.getCameraCharacteristics(it).get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_BACK }
+                  camId = backs.firstOrNull { hasRaw(cm.getCameraCharacteristics(it)) } ?: backs.first()
+                  chars = cm.getCameraCharacteristics(camId)
+                  if (!hasRaw(chars!!)) { rawSw.isChecked = false; rawSw.isEnabled = false } else rawSw.isEnabled = true
+                  h.postDelayed({
+                      try {
+                          @SuppressLint("MissingPermission")
+                          cm.openCamera(camId, object : CameraDevice.StateCallback() {
+                              override fun onOpened(d: CameraDevice) { cam = d; try { startSession(rawSw.isChecked) } catch (e: Exception) { say("Error: $e") } }
+                              override fun onDisconnected(d: CameraDevice) { d.close() }
+                              override fun onError(d: CameraDevice, e: Int) { d.close(); say("Camera error $e") }
+                          }, h)
+                      } catch (e: Exception) { say("Open failed: $e") }
+                  }, 300)
+              }
+
+              private fun closeCam() {
+                  try { session?.close() } catch (_: Exception) {}
+                  session = null; cam?.close(); cam = null
+                  try { recorder?.release() } catch (_: Exception) {}
+                  recorder = null; reader?.close(); reader = null
+              }
+
+              private fun pick(l: Array<Size>) = l.filter { it.width * 9 == it.height * 16 && it.width <= 1920 }.maxByOrNull { it.width } ?: l.first()
+
+              private fun startSession(raw: Boolean) {
+                  val c = chars!!; val d = cam!!
+                  val map = c.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)!!
+                  val pv = pick(map.getOutputSizes(SurfaceTexture::class.java))
+                  val st = tv.surfaceTexture!!; st.setDefaultBufferSize(pv.width, pv.height)
+                  val pvs = Surface(st)
+                  hint = (c.get(CameraCharacteristics.SENSOR_ORIENTATION)!! - windowManager.defaultDisplay.rotation * 90 + 360) % 360
+                  val targets = mutableListOf(pvs)
+                  val b = d.createCaptureRequest(if (raw) CameraDevice.TEMPLATE_PREVIEW else CameraDevice.TEMPLATE_RECORD)
+                  b.addTarget(pvs)
+                  var desc: String
+                  if (raw) {
+                      val l = map.getOutputSizes(ImageFormat.RAW_SENSOR).sortedBy { it.width * it.height }
+                      val sz = l.firstOrNull { it.width * it.height >= 1920 * 1080 } ?: l.last()
+                      reader = ImageReader.newInstance(sz.width, sz.height, ImageFormat.RAW_SENSOR, 8).apply { setOnImageAvailableListener({ onRaw(it) }, h) }
+                      targets += reader!!.surface; b.addTarget(reader!!.surface)
+                      desc = "RAW ${sz.width}x${sz.height} (${l.joinToString { "${it.width}x${it.height}" }})"
+                  } else {
+                      desc = "1080p60 " + prepareRecorder()
+                      targets += recorder!!.surface; b.addTarget(recorder!!.surface)
+                  }
+                  // switch off everything the phone normally does to the image
+                  fun off(k: CaptureRequest.Key<Int>, avail: CameraCharacteristics.Key<IntArray>, v: Int) { if (c.get(avail)?.contains(v) == true) b.set(k, v) }
+                  off(CaptureRequest.NOISE_REDUCTION_MODE, CameraCharacteristics.NOISE_REDUCTION_AVAILABLE_NOISE_REDUCTION_MODES, CameraMetadata.NOISE_REDUCTION_MODE_OFF)
+                  off(CaptureRequest.EDGE_MODE, CameraCharacteristics.EDGE_AVAILABLE_EDGE_MODES, CameraMetadata.EDGE_MODE_OFF)
+                  off(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES, CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_OFF)
+                  off(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE, CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION, CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_OFF)
+                  off(CaptureRequest.STATISTICS_FACE_DETECT_MODE, CameraCharacteristics.STATISTICS_INFO_AVAILABLE_FACE_DETECT_MODES, CameraMetadata.STATISTICS_FACE_DETECT_MODE_OFF)
+                  val rs = c.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES) ?: emptyArray()
+                  val r = if (raw) rs.maxByOrNull { it.upper * 1000 + it.lower }
+                          else rs.firstOrNull { it.lower == 60 && it.upper == 60 } ?: rs.filter { it.upper >= 60 }.maxByOrNull { it.lower }
+                  r?.let { b.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, it) }
+                  desc += " | fps $r"
+                  val cb = object : CameraCaptureSession.CaptureCallback() {
+                      override fun onCaptureCompleted(s: CameraCaptureSession, q: CaptureRequest, res: TotalCaptureResult) {
+                          if (recording && raw) results[res.get(CaptureResult.SENSOR_TIMESTAMP)!!] = res
+                      }
+                  }
+                  @Suppress("DEPRECATION")
+                  d.createCaptureSession(targets, object : CameraCaptureSession.StateCallback() {
+                      override fun onConfigured(s: CameraCaptureSession) {
+                          session = s; s.setRepeatingRequest(b.build(), cb, h)
+                          say("cam $camId | RAW cap: ${hasRaw(c)}\n$desc")
+                      }
+                      override fun onConfigureFailed(s: CameraCaptureSession) { say("Session failed: this camera/mode combo isn't supported") }
+                  }, h)
+              }
+
+              private fun stamp() = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+
+              private fun prepareRecorder(): String {
+                  val f = File(getExternalFilesDir(Environment.DIRECTORY_MOVIES), "VID_${stamp()}.mp4"); videoFile = f
+                  val hevc = MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.any { it.isEncoder && it.supportedTypes.contains("video/hevc") }
+                  recorder = MediaRecorder(this).apply {
+                      setAudioSource(MediaRecorder.AudioSource.MIC); setVideoSource(MediaRecorder.VideoSource.SURFACE)
+                      setOutputFormat(MediaRecorder.OutputFormat.MPEG_4); setOutputFile(f)
+                      setVideoEncoder(if (hevc) MediaRecorder.VideoEncoder.HEVC else MediaRecorder.VideoEncoder.H264)
+                      setVideoSize(1920, 1080); setVideoFrameRate(60); setVideoEncodingBitRate(100_000_000)
+                      setAudioEncoder(MediaRecorder.AudioEncoder.AAC); setAudioEncodingBitRate(256_000); setAudioSamplingRate(48_000)
+                      setOrientationHint(hint); prepare()
+                  }
+                  return if (hevc) "HEVC 100Mbps" else "H.264 100Mbps"
+              }
+
+              private fun orient() = when (hint) {
+                  90 -> ExifInterface.ORIENTATION_ROTATE_90; 180 -> ExifInterface.ORIENTATION_ROTATE_180
+                  270 -> ExifInterface.ORIENTATION_ROTATE_270; else -> ExifInterface.ORIENTATION_NORMAL
+              }
+
+              private fun onRaw(r: ImageReader) {
+                  val img = try { r.acquireNextImage() } catch (e: Exception) { dropped.incrementAndGet(); return } ?: return
+                  if (!recording) { img.close(); return }
+                  val idx = seq.incrementAndGet(); val c = chars!!; val dir = rawRel
+                  pending.incrementAndGet()
+                  pool.execute {
+                      try {
+                          var res: TotalCaptureResult? = null; var n = 0
+                          while (res == null && n++ < 100) { res = results.remove(img.timestamp); if (res == null) Thread.sleep(10) }
+                          if (res == null) { dropped.incrementAndGet(); return@execute }
+                          val dng = DngCreator(c, res); dng.setOrientation(orient())
+                          val cv = ContentValues().apply {
+                              put(MediaStore.MediaColumns.DISPLAY_NAME, "frame_%06d.dng".format(idx))
+                              put(MediaStore.MediaColumns.MIME_TYPE, "image/x-adobe-dng")
+                              put(MediaStore.MediaColumns.RELATIVE_PATH, dir)
+                          }
+                          val u = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, cv)!!
+                          contentResolver.openOutputStream(u)!!.buffered(1 shl 20).use { dng.writeImage(it, img) }
+                          dng.close(); saved.incrementAndGet()
+                      } catch (e: Exception) { dropped.incrementAndGet() }
+                      finally { img.close(); pending.decrementAndGet() }
+                  }
+              }
+
+              private val ticker = object : Runnable {
+                  override fun run() {
+                      if (!recording) return
+                      val s = (SystemClock.elapsedRealtime() - t0) / 1000.0
+                      info.text = if (rawSw.isChecked) "● ${saved.get()} DNG saved, ${dropped.get()} dropped, %.1f fps".format(saved.get() / s)
+                                  else "● REC %.0f s".format(s)
+                      ui.postDelayed(this, 500)
+                  }
+              }
+
+              private fun toggle() {
+                  if (!recording) {
+                      try {
+                          if (rawSw.isChecked) {
+                              rawRel = "Download/RawCam/SESSION_${stamp()}"
+                              seq.set(0); saved.set(0); dropped.set(0); results.clear()
+                          } else recorder!!.start()
+                      } catch (e: Exception) { say("Start failed: $e"); return }
+                      recording = true; t0 = SystemClock.elapsedRealtime()
+                      rec.text = "STOP"; rawSw.isEnabled = false; ui.post(ticker)
+                  } else {
+                      recording = false; rec.text = "REC"; rec.isEnabled = false
+                      if (!rawSw.isChecked) {
+                          try { recorder?.stop(); videoFile?.let { publish(it) } } catch (e: Exception) { videoFile?.delete() }
+                          rec.isEnabled = true; open()
+                      } else Thread {
+                          while (pending.get() > 0) Thread.sleep(50)
+                          runOnUiThread { rec.isEnabled = true; open(); info.text = "Saved ${saved.get()} DNG frames\n${rawRel}" }
+                      }.start()
+                  }
+              }
+
+              /** copy finished video into the gallery (Movies/RawCam) */
+              private fun publish(f: File) = Thread {
+                  val v = ContentValues().apply {
+                      put(MediaStore.Video.Media.DISPLAY_NAME, f.name); put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+                      put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/RawCam")
+                  }
+                  contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, v)?.let { u ->
+                      contentResolver.openOutputStream(u)?.use { o -> f.inputStream().use { it.copyTo(o) } }; f.delete()
+                  }
+              }.start()
+          }
+          EOF
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+      - name: Build
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RawCam-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
